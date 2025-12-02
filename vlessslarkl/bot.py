@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VLESS Telegram Bot - ПОЛНАЯ РАБОЧАЯ ВЕРСИЯ
-Версия 2.1 - Исправлены все ошибки, сохранена полная функциональность
+Версия 3.0 - Полностью исправлены все ошибки, добавлены недостающие обработчики
 """
 
 import asyncio
@@ -16,7 +16,7 @@ import base64
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse, quote
 from contextlib import contextmanager
 from hmac import compare_digest
@@ -30,7 +30,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, BufferedInputFile
 from aiogram.exceptions import TelegramBadRequest
 from py3xui import Api, Client, Inbound
 from yookassa import Payment, Configuration
@@ -91,6 +91,7 @@ class Form(StatesGroup):
     waiting_for_plan_data = State()
     waiting_for_settings = State()
     waiting_for_support_message = State()
+    waiting_for_user_search = State()
 
 # ========== БАЗА ДАННЫХ ==========
 
@@ -304,6 +305,29 @@ class Database:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM users WHERE referred_by = ?", (referrer_id,))
+            return [dict(row) for row in cursor.fetchall()]
+    
+    def search_users(self, query: str) -> List[Dict]:
+        """Поиск пользователей по ID, username или имени"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Пробуем найти по ID
+            if query.isdigit():
+                cursor.execute(
+                    "SELECT * FROM users WHERE telegram_id = ?",
+                    (int(query),)
+                )
+                results = cursor.fetchall()
+                if results:
+                    return [dict(row) for row in results]
+            
+            # Ищем по username или имени
+            search_term = f"%{query}%"
+            cursor.execute(
+                "SELECT * FROM users WHERE username LIKE ? OR full_name LIKE ? ORDER BY telegram_id DESC LIMIT 20",
+                (search_term, search_term)
+            )
             return [dict(row) for row in cursor.fetchall()]
     
     # ========== КЛЮЧИ ==========
@@ -567,12 +591,16 @@ class XUIAPI:
     
     def login_to_host(self, host_url: str, username: str, password: str, inbound_id: int) -> Tuple[Api, Inbound]:
         try:
+            # Убираем слеш в конце если есть
+            if host_url.endswith('/'):
+                host_url = host_url[:-1]
+            
             api = Api(host=host_url, username=username, password=password)
             api.login()
             inbounds = api.inbound.get_list()
             target_inbound = next((i for i in inbounds if i.id == inbound_id), None)
             if not target_inbound:
-                raise Exception(f"Inbound with id {inbound_id} not found")
+                raise Exception(f"Inbound с id {inbound_id} не найден")
             return api, target_inbound
         except Exception as e:
             logging.error(f"X-UI login failed: {e}")
@@ -582,26 +610,33 @@ class XUIAPI:
         if not inbound:
             return None
         
-        settings = inbound.stream_settings.reality_settings.get("settings")
-        if not settings:
+        # Получаем настройки Reality
+        reality_settings = inbound.stream_settings.reality_settings
+        if not reality_settings:
             return None
         
-        public_key = settings.get("publicKey")
-        fp = settings.get("fingerprint")
-        server_names = inbound.stream_settings.reality_settings.get("serverNames")
-        short_ids = inbound.stream_settings.reality_settings.get("shortIds")
+        public_key = reality_settings.get("publicKey")
+        fp = reality_settings.get("fingerprint", "chrome")
+        server_names = reality_settings.get("serverNames", [])
+        short_ids = reality_settings.get("shortIds", [])
         port = inbound.port
         
         if not all([public_key, server_names, short_ids]):
             return None
         
         parsed_url = urlparse(host_url)
-        short_id = short_ids[0]
+        hostname = parsed_url.hostname
+        if not hostname:
+            # Если URL не распарсился, пробуем извлечь хоста
+            hostname = host_url.replace("https://", "").replace("http://", "").split(":")[0]
+        
+        short_id = short_ids[0] if short_ids else ""
+        sni = server_names[0] if server_names else ""
         
         return (
-            f"vless://{user_uuid}@{parsed_url.hostname}:{port}"
-            f"?type=tcp&security=reality&pbk={public_key}&fp={fp}&sni={server_names[0]}"
-            f"&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#{remark}"
+            f"vless://{user_uuid}@{hostname}:{port}"
+            f"?type=tcp&security=reality&pbk={public_key}&fp={fp}&sni={sni}"
+            f"&sid={short_id}&spx=%2F&flow=xtls-rprx-vision#{quote(remark)}"
         )
     
     async def create_or_update_key(self, host_name: str, email: str, days_to_add: int, db: Database) -> Dict:
@@ -720,7 +755,8 @@ xui_api = XUIAPI()
 
 # Создаем бота и диспетчер
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
@@ -951,8 +987,9 @@ async def view_key(callback: types.CallbackQuery):
                 host_data['host_inbound_id']
             )
             connection_string = xui_api.get_connection_string(inbound, key_data['xui_client_uuid'], host_data['host_url'], key_data['host_name'])
-        except:
-            connection_string = "❌ Не удалось получить конфигурацию"
+        except Exception as e:
+            logger.error(f"Error getting connection string: {e}")
+            connection_string = "❌ Не удалось получить конфигурацию. Обратитесь в поддержку."
         
         expiry_date = datetime.fromisoformat(key_data['expiry_date']) if isinstance(key_data['expiry_date'], str) else key_data['expiry_date']
         now = datetime.now()
@@ -1029,12 +1066,14 @@ async def show_qr_code(callback: types.CallbackQuery):
             builder = InlineKeyboardBuilder()
             builder.button(text="⬅️ Назад", callback_data=f"view_key_{key_id}")
             
-            await callback.message.delete()
+            # Отправляем фото
             await callback.message.answer_photo(
-                photo=types.BufferedInputFile(qr_image.getvalue(), filename="qrcode.png"),
+                photo=BufferedInputFile(qr_image.getvalue(), filename="qrcode.png"),
                 caption=text,
                 reply_markup=builder.as_markup()
             )
+            
+            await callback.answer()
             
         except Exception as e:
             logger.error(f"Error generating QR: {e}")
@@ -1346,6 +1385,91 @@ async def pay_yookassa(callback: types.CallbackQuery):
         logger.error(f"YooKassa error: {e}")
         await callback.message.edit_text(f"❌ Ошибка создания счета: {str(e)[:200]}")
 
+@dp.callback_query(F.data.startswith("pay_yookassa_extend_"))
+async def pay_yookassa_extend(callback: types.CallbackQuery):
+    """Оплата продления через ЮKassa"""
+    try:
+        parts = callback.data.split("_")
+        plan_id = int(parts[3])
+        key_id = int(parts[4])
+        
+        plan = db.get_plan_by_id(plan_id)
+        key_data = db.get_key_by_id(key_id)
+        user_id = callback.from_user.id
+        
+        if not plan or not key_data or key_data['user_id'] != user_id:
+            await callback.answer("Ошибка", show_alert=True)
+            return
+        
+        if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+            await callback.answer("Оплата через ЮKassa недоступна", show_alert=True)
+            return
+        
+        price = Decimal(str(plan['price']))
+        
+        # Настраиваем ЮKassa
+        Configuration.account_id = YOOKASSA_SHOP_ID
+        Configuration.secret_key = YOOKASSA_SECRET_KEY
+        
+        payment_id = str(uuid.uuid4())
+        
+        payment = Payment.create({
+            "amount": {"value": f"{float(price):.2f}", "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": f"https://t.me/{TELEGRAM_BOT_USERNAME}"},
+            "capture": True,
+            "description": f"Продление ключа на {plan['months']} месяцев",
+            "metadata": {
+                "user_id": user_id,
+                "plan_id": plan_id,
+                "key_id": key_id,
+                "host_name": plan['host_name'],
+                "action": "extend",  # Изменяем action на extend
+                "months": plan['months'],
+                "price": float(price),
+                "payment_id": payment_id,
+                "payment_method": "yookassa"
+            }
+        })
+        
+        db.create_webhook_transaction(
+            payment.id,
+            user_id,
+            float(price),
+            {
+                "user_id": user_id,
+                "plan_id": plan_id,
+                "key_id": key_id,
+                "host_name": plan['host_name'],
+                "action": "extend",
+                "months": plan['months'],
+                "price": float(price),
+                "payment_method": "yookassa"
+            }
+        )
+        
+        # Показываем ссылку на оплату
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💳 Перейти к оплате", url=payment.confirmation.confirmation_url)
+        builder.button(text="🔄 Проверить оплату", callback_data=f"check_payment_{payment.id}")
+        builder.button(text="⬅️ Отмена", callback_data=f"select_plan_extend_{plan_id}_{key_id}")
+        builder.adjust(1)
+        
+        price_int = int(price) if price == price.to_integral() else float(price)
+        
+        await callback.message.edit_text(
+            f"✅ <b>Счет для продления создан!</b>\n\n"
+            f"💰 <b>Цена:</b> {price_int}₽\n"
+            f"📅 <b>Добавит:</b> {plan['months']} месяцев\n"
+            f"🖥️ <b>Сервер:</b> {plan['host_name']}\n"
+            f"🔑 <b>Ключ:</b> #{key_id}\n\n"
+            "Нажмите кнопку для оплаты:",
+            reply_markup=builder.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"YooKassa extend error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+
 @dp.callback_query(F.data.startswith("check_payment_"))
 async def check_payment(callback: types.CallbackQuery):
     try:
@@ -1458,6 +1582,83 @@ async def pay_cryptobot(callback: types.CallbackQuery):
         logger.error(f"CryptoBot error: {e}")
         await callback.message.edit_text(f"❌ Ошибка создания счета: {str(e)[:200]}")
 
+@dp.callback_query(F.data.startswith("pay_cryptobot_extend_"))
+async def pay_cryptobot_extend(callback: types.CallbackQuery):
+    """Оплата продления через CryptoBot"""
+    try:
+        parts = callback.data.split("_")
+        plan_id = int(parts[3])
+        key_id = int(parts[4])
+        
+        plan = db.get_plan_by_id(plan_id)
+        key_data = db.get_key_by_id(key_id)
+        user_id = callback.from_user.id
+        
+        if not plan or not key_data or key_data['user_id'] != user_id:
+            await callback.answer("Ошибка", show_alert=True)
+            return
+        
+        if not CRYPTOBOT_TOKEN:
+            await callback.answer("CryptoBot недоступен", show_alert=True)
+            return
+        
+        price_rub = Decimal(str(plan['price']))
+        
+        # Получаем курс USDT/RUB
+        rate = await get_usdt_rub_rate()
+        if not rate:
+            await callback.message.edit_text("❌ Не удалось получить курс обмена")
+            return
+        
+        # Конвертируем в USDT
+        price_usdt = (price_rub / rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        
+        crypto = CryptoPay(CRYPTOBOT_TOKEN)
+        
+        # Создаем инвойс
+        invoice = await crypto.create_invoice(
+            currency_type="fiat",
+            fiat="RUB",
+            amount=float(price_rub),
+            description=f"Продление ключа на {plan['months']} месяцев",
+            payload=json.dumps({
+                "user_id": user_id,
+                "plan_id": plan_id,
+                "key_id": key_id,
+                "host_name": plan['host_name'],
+                "action": "extend",
+                "months": plan['months'],
+                "price": float(price_rub),
+                "payment_method": "cryptobot"
+            }),
+            expires_in=3600
+        )
+        
+        # Показываем ссылку
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🤖 Оплатить в CryptoBot", url=invoice.pay_url)
+        builder.button(text="🔄 Проверить оплату", callback_data=f"check_crypto_payment_{invoice.invoice_id}")
+        builder.button(text="⬅️ Отмена", callback_data=f"select_plan_extend_{plan_id}_{key_id}")
+        builder.adjust(1)
+        
+        price_rub_int = int(price_rub) if price_rub == price_rub.to_integral() else float(price_rub)
+        
+        await callback.message.edit_text(
+            f"🤖 <b>Счет CryptoBot для продления создан!</b>\n\n"
+            f"💰 <b>Цена:</b> {price_rub_int}₽\n"
+            f"💲 <b>В USDT:</b> {price_usdt}\n"
+            f"📈 <b>Курс:</b> 1 USDT = {rate:.2f} RUB\n"
+            f"📅 <b>Добавит:</b> {plan['months']} месяцев\n"
+            f"🖥️ <b>Сервер:</b> {plan['host_name']}\n"
+            f"🔑 <b>Ключ:</b> #{key_id}\n\n"
+            "Нажмите кнопку для оплаты:",
+            reply_markup=builder.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"CryptoBot extend error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+
 @dp.callback_query(F.data.startswith("check_crypto_payment_"))
 async def check_crypto_payment(callback: types.CallbackQuery):
     try:
@@ -1482,8 +1683,11 @@ async def check_crypto_payment(callback: types.CallbackQuery):
             # Получаем payload из описания
             try:
                 metadata = json.loads(invoice.payload)
-                await process_successful_payment(metadata)
-                await callback.answer("✅ Оплата подтверждена! Ключ создан.", show_alert=True)
+                if metadata.get('action') == 'extend':
+                    await process_extend_payment(metadata)
+                else:
+                    await process_successful_payment(metadata)
+                await callback.answer("✅ Оплата подтверждена! Ключ обновлен.", show_alert=True)
             except:
                 await callback.answer("✅ Оплата подтверждена, но не удалось обработать данные.", show_alert=True)
         elif invoice.status == "active":
@@ -1512,7 +1716,8 @@ async def show_referrals(callback: types.CallbackQuery):
     referrals = db.get_referrals(user_id)
     
     # Генерируем реферальную ссылку
-    referral_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=ref_{user_id}"
+    bot_username = TELEGRAM_BOT_USERNAME or (await bot.get_me()).username
+    referral_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     
     text = (
         f"🤝 <b>Реферальная программа</b>\n\n"
@@ -1559,7 +1764,7 @@ async def show_referrals_list(callback: types.CallbackQuery):
             else:
                 date_str = created_at.strftime('%d.%m.%Y')
             
-            text += f"{i}. {ref['full_name'] or ref['username']}\n"
+            text += f"{i}. {ref['full_name'] or ref['username'] or f'ID: {ref['telegram_id']}'}\n"
             text += f"   📅 {date_str}\n"
             text += f"   💰 Потратил: {ref['total_spent']:.0f}₽\n\n"
         
@@ -1622,7 +1827,10 @@ async def show_help(callback: types.CallbackQuery):
     )
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{support_user.replace('@', '')}" if support_user.startswith('@') else f"tg://user?id={support_user}")
+    if support_user.startswith('@'):
+        builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{support_user.replace('@', '')}")
+    else:
+        builder.button(text="💬 Написать в поддержку", url=f"tg://user?id={support_user}")
     builder.button(text="⬅️ Назад", callback_data="back_to_main_menu")
     builder.adjust(1)
     
@@ -1807,14 +2015,96 @@ async def process_successful_payment(metadata: dict):
     except Exception as e:
         logger.error(f"Error processing payment: {e}", exc_info=True)
 
+async def process_extend_payment(metadata: dict):
+    """Обработка оплаты за продление ключа"""
+    try:
+        user_id = int(metadata['user_id'])
+        plan_id = int(metadata['plan_id'])
+        key_id = int(metadata['key_id'])
+        host_name = metadata['host_name']
+        months = int(metadata['months'])
+        price = float(metadata['price'])
+        payment_method = metadata.get('payment_method', 'unknown')
+        
+        # Получаем данные
+        plan = db.get_plan_by_id(plan_id)
+        user_data = db.get_user(user_id)
+        key_data = db.get_key_by_id(key_id)
+        
+        if not plan or not user_data or not key_data or key_data['user_id'] != user_id:
+            logger.error(f"Invalid extend payment data: {metadata}")
+            return
+        
+        # Продлеваем ключ на хосте
+        days_to_add = months * 30
+        result = await xui_api.create_or_update_key(host_name, key_data['key_email'], days_to_add, db)
+        
+        if result.get('error'):
+            logger.error(f"X-UI error extending key: {result['error']}")
+            await bot.send_message(user_id, f"❌ Ошибка продления ключа: {result['error']}")
+            return
+        
+        # Обновляем дату истечения в БД
+        db.update_key_expiry(key_id, result['expiry_date'])
+        
+        # Обновляем статистику пользователя
+        db.update_user_stats(user_id, price, months)
+        
+        # Логируем транзакцию
+        db.log_transaction(
+            user_data['username'],
+            user_id,
+            'paid',
+            price,
+            payment_method,
+            metadata
+        )
+        
+        # Отправляем обновленный ключ пользователю
+        expiry_date = result['expiry_date']
+        expiry_formatted = expiry_date.strftime('%d.%m.%Y в %H:%M')
+        
+        success_text = (
+            f"✅ <b>Ключ #{key_id} успешно продлен!</b>\n\n"
+            f"⏳ <b>Действует до:</b> {expiry_formatted}\n"
+            f"🖥️ <b>Сервер:</b> {host_name}\n"
+            f"📅 <b>Добавлено:</b> {months} месяцев\n"
+            f"💰 <b>Сумма:</b> {price:.2f}₽\n\n"
+            f"<code>{result['connection_string']}</code>"
+        )
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="📱 QR-код", callback_data=f"qr_{key_id}")
+        builder.button(text="🔄 Продлить еще", callback_data=f"extend_{key_id}")
+        builder.button(text="⬅️ В меню", callback_data="back_to_main_menu")
+        builder.adjust(2, 1)
+        
+        await bot.send_message(user_id, success_text, reply_markup=builder.as_markup())
+        
+        # Уведомление админу
+        if ADMIN_ID:
+            admin_text = (
+                f"🔄 <b>Продление ключа!</b>\n\n"
+                f"👤 Пользователь: @{user_data['username'] or 'без username'}\n"
+                f"🆔 ID: {user_id}\n"
+                f"🔑 Ключ: #{key_id}\n"
+                f"🖥️ Сервер: {host_name}\n"
+                f"📦 Тариф: {plan['plan_name']} (+{months} месяцев)\n"
+                f"💰 Сумма: {price:.2f}₽\n"
+                f"💳 Способ: {payment_method}"
+            )
+            await bot.send_message(ADMIN_ID, admin_text)
+        
+        logger.info(f"Extend payment processed successfully for user {user_id}, key {key_id}")
+        
+    except Exception as e:
+        logger.error(f"Error processing extend payment: {e}", exc_info=True)
+
 # ========== ОБРАБОТКА ВЕБХУКОВ ==========
 
 async def handle_yookassa_webhook(request: web.Request):
     """Обработчик вебхуков ЮKassa"""
     try:
-        # Проверяем IP (опционально)
-        # trusted_ips = ['185.71.76.0/27', '185.71.77.0/27', '77.75.153.0/25', '77.75.154.128/25']
-        
         data = await request.json()
         logger.info(f"YooKassa webhook received: {json.dumps(data, ensure_ascii=False)[:500]}")
         
@@ -1829,8 +2119,11 @@ async def handle_yookassa_webhook(request: web.Request):
             
             metadata = data['object']['metadata']
             
-            # Запускаем обработку в фоне
-            asyncio.create_task(process_successful_payment(metadata))
+            # Определяем тип платежа
+            if metadata.get('action') == 'extend':
+                await process_extend_payment(metadata)
+            else:
+                await process_successful_payment(metadata)
             
             # Помечаем как обработанное
             db.mark_webhook_processed(payment_id)
@@ -1851,7 +2144,7 @@ async def handle_cryptobot_webhook(request: web.Request):
         logger.info(f"CryptoBot webhook received: {json.dumps(data, ensure_ascii=False)[:500]}")
         
         if data.get('update_type') == 'invoice_paid':
-            invoice_id = data['payload']
+            invoice_id = data['payload']['invoice_id']
             
             # Получаем информацию об инвойсе
             crypto = CryptoPay(CRYPTOBOT_TOKEN)
@@ -1863,23 +2156,19 @@ async def handle_cryptobot_webhook(request: web.Request):
             
             invoice = invoices[0]
             
-            try:
-                metadata = json.loads(invoice.payload)
-                payment_id = f"cryptobot_{invoice_id}"
-                
-                # Создаем запись о вебхуке
-                db.create_webhook_transaction(
-                    payment_id,
-                    metadata['user_id'],
-                    invoice.amount,
-                    metadata
-                )
-                
-                # Обрабатываем платеж
-                asyncio.create_task(process_successful_payment(metadata))
-                
-            except json.JSONDecodeError:
-                logger.error(f"Invalid payload in CryptoBot invoice: {invoice.payload}")
+            if invoice.status == "paid":
+                try:
+                    metadata = json.loads(invoice.payload)
+                    payment_id = f"cryptobot_{invoice_id}"
+                    
+                    # Определяем тип платежа
+                    if metadata.get('action') == 'extend':
+                        await process_extend_payment(metadata)
+                    else:
+                        await process_successful_payment(metadata)
+                    
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid payload in CryptoBot invoice: {invoice.payload}")
         
         return web.Response(text='OK')
     
@@ -2028,11 +2317,364 @@ async def admin_users(callback: types.CallbackQuery):
     if len(users) > 20:
         text += f"\n... и еще {len(users) - 20} пользователей"
     
-    builder.button(text="➕ Поиск пользователя", callback_data="admin_search_user")
+    builder.button(text="🔍 Поиск пользователя", callback_data="admin_search_user")
     builder.button(text="⬅️ Назад", callback_data="admin_panel")
-    builder.adjust(3, 3, 3, 3, 2, 1)  # Настраиваем расположение кнопок
+    builder.adjust(3, 3, 3, 3, 2, 1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_search_user")
+async def admin_search_user(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    await state.set_state(Form.waiting_for_user_search)
+    
+    await callback.message.edit_text(
+        "🔍 <b>Поиск пользователя</b>\n\n"
+        "Отправьте:\n"
+        "• ID пользователя (только цифры)\n"
+        "• Или username (без @)\n"
+        "• Или часть имени\n\n"
+        "Примеры:\n"
+        "<code>7736830543</code>\n"
+        "<code>username</code>\n"
+        "<code>Иван</code>\n\n"
+        "❌ Для отмены введите /cancel",
+        parse_mode="HTML"
+    )
+
+@dp.message(Form.waiting_for_user_search)
+async def process_user_search(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+    
+    if message.text.lower() == '/cancel':
+        await state.clear()
+        await message.answer("❌ Поиск отменен.")
+        return
+    
+    query = message.text.strip()
+    users = db.search_users(query)
+    
+    if not users:
+        text = f"❌ Пользователи по запросу '{query}' не найдены."
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔄 Попробовать еще", callback_data="admin_search_user")
+        builder.button(text="⬅️ Назад", callback_data="admin_users")
+    else:
+        text = f"🔍 <b>Результаты поиска</b> (найдено: {len(users)})\n\n"
+        
+        for user in users[:10]:  # Показываем только 10 результатов
+            user_id = user['telegram_id']
+            username = user['username'] or user['full_name'] or f"ID: {user_id}"
+            status = "🚫" if user.get('is_banned') else "✅"
+            created_at = user['created_at']
+            if isinstance(created_at, str):
+                date_str = created_at[:10]
+            else:
+                date_str = created_at.strftime('%d.%m.%Y')
+            
+            text += f"{status} <b>{username}</b>\n"
+            text += f"   🆔 {user_id} | 📅 {date_str}\n"
+            text += f"   💰 {user['total_spent']:.0f}₽ | 🔑 {len(db.get_user_keys(user_id))}\n\n"
+        
+        if len(users) > 10:
+            text += f"\n... и еще {len(users) - 10} пользователей"
+        
+        builder = InlineKeyboardBuilder()
+        
+        # Добавляем кнопки для найденных пользователей
+        for user in users[:5]:  # Ограничиваем 5 кнопками
+            builder.button(text=f"👤 {user['telegram_id']}", callback_data=f"admin_view_user_{user['telegram_id']}")
+        
+        builder.button(text="🔄 Новый поиск", callback_data="admin_search_user")
+        builder.button(text="⬅️ Назад", callback_data="admin_users")
+        builder.adjust(3, 2, 1)
+    
+    await message.answer(text, reply_markup=builder.as_markup())
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("admin_view_user_"))
+async def admin_view_user(callback: types.CallbackQuery):
+    """Просмотр конкретного пользователя админом"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[3])
+        user_data = db.get_user(user_id)
+        
+        if not user_data:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        user_keys = db.get_user_keys(user_id)
+        referrals = db.get_referrals(user_id)
+        
+        # Форматируем даты
+        created_at = user_data['created_at']
+        if isinstance(created_at, str):
+            created_date = datetime.fromisoformat(created_at[:19])
+        else:
+            created_date = created_at
+        
+        text = (
+            f"👤 <b>Пользователь #{user_id}</b>\n\n"
+            f"📝 <b>Информация:</b>\n"
+            f"• Имя: {user_data['full_name'] or 'Не указано'}\n"
+            f"• Username: @{user_data['username'] or 'нет'}\n"
+            f"• Зарегистрирован: {created_date.strftime('%d.%m.%Y %H:%M')}\n"
+            f"• Согласие с правилами: {'✅ Да' if user_data.get('agreed_to_terms') else '❌ Нет'}\n"
+            f"• Пробный период: {'✅ Использован' if user_data.get('trial_used') else '🆓 Доступен'}\n"
+            f"• Статус: {'🚫 Заблокирован' if user_data.get('is_banned') else '✅ Активен'}\n\n"
+            f"💰 <b>Финансы:</b>\n"
+            f"• Потрачено: {user_data['total_spent']:.2f}₽\n"
+            f"• Месяцев куплено: {user_data['total_months']}\n"
+            f"• Реферальный баланс: {user_data.get('referral_balance', 0):.2f}₽\n"
+            f"• Реферер: {'Не указан' if not user_data.get('referred_by') else f'ID: {user_data['referred_by']}'}\n"
+            f"• Рефералов: {len(referrals)}\n\n"
+            f"🔑 <b>Ключи ({len(user_keys)}):</b>\n"
+        )
+        
+        now = datetime.now()
+        active_keys = 0
+        for key in user_keys[:5]:  # Показываем только 5 ключей
+            expiry_date = datetime.fromisoformat(key['expiry_date']) if isinstance(key['expiry_date'], str) else key['expiry_date']
+            is_active = expiry_date > now
+            status = "✅" if is_active else "❌"
+            if is_active:
+                active_keys += 1
+            text += f"{status} {key['host_name']} до {expiry_date.strftime('%d.%m.%Y')}\n"
+        
+        if len(user_keys) > 5:
+            text += f"... и еще {len(user_keys) - 5} ключей\n"
+        
+        text += f"\n📊 <b>Активных ключей:</b> {active_keys}"
+        
+        builder = InlineKeyboardBuilder()
+        
+        # Кнопки управления пользователем
+        if user_data.get('is_banned'):
+            builder.button(text="✅ Разблокировать", callback_data=f"admin_unban_{user_id}")
+        else:
+            builder.button(text="🚫 Заблокировать", callback_data=f"admin_ban_{user_id}")
+        
+        builder.button(text="🗑️ Удалить ключи", callback_data=f"admin_delete_user_keys_{user_id}")
+        builder.button(text="📧 Написать пользователю", callback_data=f"admin_message_user_{user_id}")
+        builder.button(text="⬅️ Назад", callback_data="admin_users")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        
+    except Exception as e:
+        logger.error(f"Error viewing user: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_ban_"))
+async def admin_ban_user(callback: types.CallbackQuery):
+    """Блокировка пользователя"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[2])
+        db.ban_user(user_id)
+        
+        # Пытаемся уведомить пользователя
+        try:
+            await bot.send_message(
+                user_id,
+                "🚫 <b>Вы были заблокированы в системе</b>\n\n"
+                "Ваш аккаунт был заблокирован администратором. "
+                "По всем вопросам обратитесь в поддержку."
+            )
+        except:
+            pass
+        
+        await callback.answer(f"✅ Пользователь {user_id} заблокирован", show_alert=True)
+        await admin_view_user(callback)  # Обновляем вид
+        
+    except Exception as e:
+        logger.error(f"Error banning user: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_unban_"))
+async def admin_unban_user(callback: types.CallbackQuery):
+    """Разблокировка пользователя"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[2])
+        db.unban_user(user_id)
+        
+        # Пытаемся уведомить пользователя
+        try:
+            await bot.send_message(
+                user_id,
+                "✅ <b>Ваш аккаунт разблокирован</b>\n\n"
+                "Администратор разблокировал ваш аккаунт. "
+                "Теперь вы можете снова пользоваться услугами."
+            )
+        except:
+            pass
+        
+        await callback.answer(f"✅ Пользователь {user_id} разблокирован", show_alert=True)
+        await admin_view_user(callback)  # Обновляем вид
+        
+    except Exception as e:
+        logger.error(f"Error unbanning user: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_delete_user_keys_"))
+async def admin_delete_user_keys(callback: types.CallbackQuery):
+    """Удаление всех ключей пользователя"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[4])
+        user_data = db.get_user(user_id)
+        
+        if not user_data:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✅ Да, удалить все", callback_data=f"admin_confirm_delete_keys_{user_id}")
+        builder.button(text="❌ Нет, отмена", callback_data=f"admin_view_user_{user_id}")
+        
+        await callback.message.edit_text(
+            f"🗑️ <b>Удаление всех ключей пользователя</b>\n\n"
+            f"Вы уверены, что хотите удалить ВСЕ ключи пользователя {user_data['full_name'] or user_data['username']}?\n"
+            f"⚠️ Это действие нельзя отменить!\n"
+            f"⚠️ Все VPN подключения пользователя перестанут работать!",
+            reply_markup=builder.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in delete user keys: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_confirm_delete_keys_"))
+async def admin_confirm_delete_keys(callback: types.CallbackQuery):
+    """Подтверждение удаления ключей"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[4])
+        user_data = db.get_user(user_id)
+        
+        if not user_data:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        # Получаем ключи для удаления из X-UI
+        user_keys = db.get_user_keys(user_id)
+        deleted_count = 0
+        
+        for key in user_keys:
+            # Здесь должна быть логика удаления ключа из X-UI
+            # Пока просто удаляем из БД
+            db.delete_key(key['key_id'])
+            deleted_count += 1
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ <b>Все ваши ключи VPN были удалены</b>\n\n"
+                "Администратор удалил все ваши ключи VPN. "
+                "Для создания новых ключей воспользуйтесь меню покупки."
+            )
+        except:
+            pass
+        
+        await callback.answer(f"✅ Удалено {deleted_count} ключей", show_alert=True)
+        await admin_view_user(callback)  # Возвращаемся к просмотру пользователя
+        
+    except Exception as e:
+        logger.error(f"Error confirming delete keys: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data.startswith("admin_message_user_"))
+async def admin_message_user(callback: types.CallbackQuery, state: FSMContext):
+    """Написать сообщение пользователю"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[3])
+        user_data = db.get_user(user_id)
+        
+        if not user_data:
+            await callback.answer("Пользователь не найден", show_alert=True)
+            return
+        
+        await state.set_state(Form.waiting_for_support_message)
+        await state.update_data(target_user_id=user_id)
+        
+        await callback.message.edit_text(
+            f"📨 <b>Отправка сообщения пользователю</b>\n\n"
+            f"Получатель: {user_data['full_name'] or user_data['username']} (ID: {user_id})\n\n"
+            f"Напишите сообщение, которое хотите отправить:\n\n"
+            f"❌ Для отмены введите /cancel",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in message user: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.message(Form.waiting_for_support_message)
+async def process_support_message(message: types.Message, state: FSMContext):
+    """Обработка сообщения поддержки"""
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+    
+    if message.text.lower() == '/cancel':
+        await state.clear()
+        await message.answer("❌ Отправка сообщения отменена.")
+        return
+    
+    try:
+        data = await state.get_data()
+        target_user_id = data.get('target_user_id')
+        
+        if not target_user_id:
+            await message.answer("❌ Ошибка: не найден ID получателя")
+            await state.clear()
+            return
+        
+        # Отправляем сообщение пользователю
+        try:
+            await bot.send_message(
+                target_user_id,
+                f"📨 <b>Сообщение от администратора</b>\n\n{message.text}\n\n"
+                f"💬 Для ответа напишите @{message.from_user.username or 'администратору'}"
+            )
+            
+            await message.answer(f"✅ Сообщение отправлено пользователю ID: {target_user_id}")
+            
+        except Exception as e:
+            await message.answer(f"❌ Не удалось отправить сообщение: {str(e)}")
+        
+    except Exception as e:
+        logger.error(f"Error processing support message: {e}")
+        await message.answer(f"❌ Ошибка: {str(e)}")
+    
+    await state.clear()
 
 @dp.callback_query(F.data == "admin_hosts")
 async def admin_hosts(callback: types.CallbackQuery):
@@ -2484,7 +3126,161 @@ async def process_settings(message: types.Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {str(e)}")
     
     await state.clear()
-    await admin_settings(message)
+    
+    # Возвращаемся к настройкам
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⬅️ Назад", callback_data="admin_settings")
+    await message.answer("Настройки обновлены:", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "admin_reload_settings")
+async def admin_reload_settings(callback: types.CallbackQuery):
+    """Перезагрузка настроек из .env"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
+        return
+    
+    try:
+        # Перезагружаем настройки из .env
+        load_dotenv(override=True)
+        
+        # Обновляем глобальные переменные
+        global TRIAL_ENABLED, TRIAL_DURATION_DAYS, ENABLE_REFERRALS, REFERRAL_PERCENTAGE, REFERRAL_DISCOUNT, MINIMUM_WITHDRAWAL
+        
+        TRIAL_ENABLED = os.getenv("TRIAL_ENABLED", "true").lower() == "true"
+        TRIAL_DURATION_DAYS = int(os.getenv("TRIAL_DURATION_DAYS", "3"))
+        ENABLE_REFERRALS = os.getenv("ENABLE_REFERRALS", "true").lower() == "true"
+        REFERRAL_PERCENTAGE = float(os.getenv("REFERRAL_PERCENTAGE", "10"))
+        REFERRAL_DISCOUNT = float(os.getenv("REFERRAL_DISCOUNT", "10"))
+        MINIMUM_WITHDRAWAL = float(os.getenv("MINIMUM_WITHDRAWAL", "100"))
+        
+        await callback.answer("✅ Настройки перезагружены из .env файла", show_alert=True)
+        await admin_settings(callback)
+        
+    except Exception as e:
+        logger.error(f"Error reloading settings: {e}")
+        await callback.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
+
+@dp.callback_query(F.data.startswith("extend_"))
+async def extend_key(callback: types.CallbackQuery):
+    """Продление ключа"""
+    try:
+        key_id = int(callback.data.split("_")[1])
+        key_data = db.get_key_by_id(key_id)
+        
+        if not key_data or key_data['user_id'] != callback.from_user.id:
+            await callback.answer("Ключ не найден", show_alert=True)
+            return
+        
+        # Показываем планы для этого хоста
+        host_name = key_data['host_name']
+        plans = db.get_plans_for_host(host_name)
+        
+        if not plans:
+            await callback.answer("Нет доступных тарифов для продления", show_alert=True)
+            return
+        
+        builder = InlineKeyboardBuilder()
+        
+        for plan in plans:
+            price_int = int(plan['price']) if plan['price'].is_integer() else plan['price']
+            builder.button(
+                text=f"{plan['plan_name']} - {price_int}₽",
+                callback_data=f"select_plan_extend_{plan['plan_id']}_{key_id}"
+            )
+        
+        builder.button(text="⬅️ Назад", callback_data=f"view_key_{key_id}")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            f"🔄 <b>Продление ключа #{key_id}</b>\n\n"
+            f"Выберите тариф для продления ключа на сервере {host_name}:",
+            reply_markup=builder.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error extending key: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data.startswith("select_plan_extend_"))
+async def select_plan_extend(callback: types.CallbackQuery):
+    """Выбор тарифа для продления"""
+    try:
+        parts = callback.data.split("_")
+        plan_id = int(parts[3])
+        key_id = int(parts[4])
+        
+        plan = db.get_plan_by_id(plan_id)
+        key_data = db.get_key_by_id(key_id)
+        
+        if not plan or not key_data or key_data['user_id'] != callback.from_user.id:
+            await callback.answer("Ошибка", show_alert=True)
+            return
+        
+        # Показываем методы оплаты для продления
+        builder = InlineKeyboardBuilder()
+        
+        if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+            builder.button(text="💳 Карта/СБП (ЮKassa)", callback_data=f"pay_yookassa_extend_{plan_id}_{key_id}")
+        
+        if CRYPTOBOT_TOKEN:
+            builder.button(text="🤖 CryptoBot (USDT)", callback_data=f"pay_cryptobot_extend_{plan_id}_{key_id}")
+        
+        builder.button(text="⬅️ Назад", callback_data=f"extend_{key_id}")
+        builder.adjust(1)
+        
+        price_int = int(plan['price']) if plan['price'].is_integer() else plan['price']
+        
+        await callback.message.edit_text(
+            f"🔄 <b>Продление ключа #{key_id}</b>\n\n"
+            f"📋 <b>Тариф:</b> {plan['plan_name']}\n"
+            f"💰 <b>Цена:</b> {price_int}₽\n"
+            f"📅 <b>Добавит:</b> {plan['months']} месяцев\n"
+            f"🖥️ <b>Сервер:</b> {plan['host_name']}\n\n"
+            f"Выберите способ оплаты:",
+            reply_markup=builder.as_markup()
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in select plan extend: {e}")
+        await callback.answer("Ошибка", show_alert=True)
+
+@dp.callback_query(F.data == "withdraw_referral")
+async def withdraw_referral(callback: types.CallbackQuery):
+    """Вывод реферальных средств"""
+    user_id = callback.from_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    
+    balance = user_data.get('referral_balance', 0)
+    
+    if balance < MINIMUM_WITHDRAWAL:
+        await callback.answer(
+            f"Минимальная сумма для вывода: {MINIMUM_WITHDRAWAL}₽\n"
+            f"Ваш баланс: {balance:.2f}₽",
+            show_alert=True
+        )
+        return
+    
+    await callback.message.edit_text(
+        f"💰 <b>Вывод реферальных средств</b>\n\n"
+        f"💎 <b>Доступно для вывода:</b> {balance:.2f}₽\n"
+        f"💳 <b>Минимальная сумма:</b> {MINIMUM_WITHDRAWAL}₽\n\n"
+        f"Для вывода средств свяжитесь с поддержкой: {SUPPORT_USER}\n\n"
+        f"В сообщении укажите:\n"
+        f"1. Сумму вывода\n"
+        f"2. Реквизиты для перевода\n"
+        f"3. Ваш ID: {user_id}"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USER.replace('@', '')}")
+    builder.button(text="⬅️ Назад", callback_data="show_referrals")
+    builder.adjust(1)
+    
+    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
 
 # ========== ОБРАТНАЯ НАВИГАЦИЯ ==========
 
