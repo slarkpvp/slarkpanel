@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VLESS Telegram Bot - ПОЛНАЯ РАБОЧАЯ ВЕРСИЯ
-Версия 3.0 - Полностью исправлены все ошибки, добавлены недостающие обработчики
+Версия 3.1 - Добавлены все обработчики callback'ов
 """
 
 import asyncio
@@ -808,7 +808,7 @@ def create_qr_code(connection_string: str) -> BytesIO:
     bio.seek(0)
     return bio
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+# ========== ОБЩИЕ ОБРАБОТЧИКИ ==========
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -861,7 +861,12 @@ async def cmd_menu(message: types.Message):
     
     await message.answer("Главное меню:", reply_markup=create_main_menu(user_id))
 
-# ========== ОБРАБОТЧИКИ ПРОФИЛЯ ==========
+@dp.callback_query(F.data == "back_to_main_menu")
+async def back_to_main_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    await callback.message.edit_text("Главное меню:", reply_markup=create_main_menu(user_id))
+
+# ========== ПРОФИЛЬ И КЛЮЧИ ==========
 
 @dp.callback_query(F.data == "show_profile")
 async def show_profile(callback: types.CallbackQuery):
@@ -1254,9 +1259,6 @@ async def select_plan(callback: types.CallbackQuery):
     
     if CRYPTOBOT_TOKEN:
         payment_methods_available.append(("🤖 CryptoBot (USDT)", f"pay_cryptobot_{plan_id}"))
-    
-    if HELEKET_MERCHANT_ID and HELEKET_API_KEY:
-        payment_methods_available.append(("💎 Heleket (TON)", f"pay_heleket_{plan_id}"))
     
     if not payment_methods_available:
         await callback.message.edit_text("❌ Нет доступных методов оплаты")
@@ -1799,7 +1801,45 @@ async def referral_help(callback: types.CallbackQuery):
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
 
-# ========== ПОДДЕРЖКА ==========
+@dp.callback_query(F.data == "withdraw_referral")
+async def withdraw_referral(callback: types.CallbackQuery):
+    """Вывод реферальных средств"""
+    user_id = callback.from_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    
+    balance = user_data.get('referral_balance', 0)
+    
+    if balance < MINIMUM_WITHDRAWAL:
+        await callback.answer(
+            f"Минимальная сумма для вывода: {MINIMUM_WITHDRAWAL}₽\n"
+            f"Ваш баланс: {balance:.2f}₽",
+            show_alert=True
+        )
+        return
+    
+    await callback.message.edit_text(
+        f"💰 <b>Вывод реферальных средств</b>\n\n"
+        f"💎 <b>Доступно для вывода:</b> {balance:.2f}₽\n"
+        f"💳 <b>Минимальная сумма:</b> {MINIMUM_WITHDRAWAL}₽\n\n"
+        f"Для вывода средств свяжитесь с поддержкой: {SUPPORT_USER}\n\n"
+        f"В сообщении укажите:\n"
+        f"1. Сумму вывода\n"
+        f"2. Реквизиты для перевода\n"
+        f"3. Ваш ID: {user_id}"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USER.replace('@', '')}")
+    builder.button(text="⬅️ Назад", callback_data="show_referrals")
+    builder.adjust(1)
+    
+    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+
+# ========== ПОДДЕРЖКА И О ПРОЕКТЕ ==========
 
 @dp.callback_query(F.data == "show_help")
 async def show_help(callback: types.CallbackQuery):
@@ -1835,8 +1875,6 @@ async def show_help(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
-
-# ========== О ПРОЕКТЕ ==========
 
 @dp.callback_query(F.data == "show_about")
 async def show_about(callback: types.CallbackQuery):
@@ -2100,84 +2138,91 @@ async def process_extend_payment(metadata: dict):
     except Exception as e:
         logger.error(f"Error processing extend payment: {e}", exc_info=True)
 
-# ========== ОБРАБОТКА ВЕБХУКОВ ==========
+# ========== ПРОДЛЕНИЕ КЛЮЧЕЙ ==========
 
-async def handle_yookassa_webhook(request: web.Request):
-    """Обработчик вебхуков ЮKassa"""
+@dp.callback_query(F.data.startswith("extend_"))
+async def extend_key(callback: types.CallbackQuery):
+    """Продление ключа"""
     try:
-        data = await request.json()
-        logger.info(f"YooKassa webhook received: {json.dumps(data, ensure_ascii=False)[:500]}")
+        key_id = int(callback.data.split("_")[1])
+        key_data = db.get_key_by_id(key_id)
         
-        if data.get('event') == 'payment.succeeded':
-            payment_id = data['object']['id']
-            
-            # Проверяем, не обрабатывали ли мы уже этот платеж
-            webhook_tx = db.get_webhook_transaction(payment_id)
-            if not webhook_tx:
-                logger.warning(f"Unknown payment ID in webhook: {payment_id}")
-                return web.Response(text='Unknown payment', status=400)
-            
-            metadata = data['object']['metadata']
-            
-            # Определяем тип платежа
-            if metadata.get('action') == 'extend':
-                await process_extend_payment(metadata)
-            else:
-                await process_successful_payment(metadata)
-            
-            # Помечаем как обработанное
-            db.mark_webhook_processed(payment_id)
+        if not key_data or key_data['user_id'] != callback.from_user.id:
+            await callback.answer("Ключ не найден", show_alert=True)
+            return
         
-        return web.Response(text='OK')
-    
-    except json.JSONDecodeError:
-        logger.error("Invalid JSON in YooKassa webhook")
-        return web.Response(text='Invalid JSON', status=400)
+        # Показываем планы для этого хоста
+        host_name = key_data['host_name']
+        plans = db.get_plans_for_host(host_name)
+        
+        if not plans:
+            await callback.answer("Нет доступных тарифов для продления", show_alert=True)
+            return
+        
+        builder = InlineKeyboardBuilder()
+        
+        for plan in plans:
+            price_int = int(plan['price']) if plan['price'].is_integer() else plan['price']
+            builder.button(
+                text=f"{plan['plan_name']} - {price_int}₽",
+                callback_data=f"select_plan_extend_{plan['plan_id']}_{key_id}"
+            )
+        
+        builder.button(text="⬅️ Назад", callback_data=f"view_key_{key_id}")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            f"🔄 <b>Продление ключа #{key_id}</b>\n\n"
+            f"Выберите тариф для продления ключа на сервере {host_name}:",
+            reply_markup=builder.as_markup()
+        )
+        
     except Exception as e:
-        logger.error(f"YooKassa webhook error: {e}", exc_info=True)
-        return web.Response(text='ERROR', status=500)
+        logger.error(f"Error extending key: {e}")
+        await callback.answer("Ошибка", show_alert=True)
 
-async def handle_cryptobot_webhook(request: web.Request):
-    """Обработчик вебхуков CryptoBot"""
+@dp.callback_query(F.data.startswith("select_plan_extend_"))
+async def select_plan_extend(callback: types.CallbackQuery):
+    """Выбор тарифа для продления"""
     try:
-        data = await request.json()
-        logger.info(f"CryptoBot webhook received: {json.dumps(data, ensure_ascii=False)[:500]}")
+        parts = callback.data.split("_")
+        plan_id = int(parts[3])
+        key_id = int(parts[4])
         
-        if data.get('update_type') == 'invoice_paid':
-            invoice_id = data['payload']['invoice_id']
-            
-            # Получаем информацию об инвойсе
-            crypto = CryptoPay(CRYPTOBOT_TOKEN)
-            invoices = await crypto.get_invoices(invoice_ids=int(invoice_id))
-            
-            if not invoices:
-                logger.warning(f"Invoice not found: {invoice_id}")
-                return web.Response(text='Invoice not found', status=400)
-            
-            invoice = invoices[0]
-            
-            if invoice.status == "paid":
-                try:
-                    metadata = json.loads(invoice.payload)
-                    payment_id = f"cryptobot_{invoice_id}"
-                    
-                    # Определяем тип платежа
-                    if metadata.get('action') == 'extend':
-                        await process_extend_payment(metadata)
-                    else:
-                        await process_successful_payment(metadata)
-                    
-                except json.JSONDecodeError:
-                    logger.error(f"Invalid payload in CryptoBot invoice: {invoice.payload}")
+        plan = db.get_plan_by_id(plan_id)
+        key_data = db.get_key_by_id(key_id)
         
-        return web.Response(text='OK')
-    
-    except json.JSONDecodeError:
-        logger.error("Invalid JSON in CryptoBot webhook")
-        return web.Response(text='Invalid JSON', status=400)
+        if not plan or not key_data or key_data['user_id'] != callback.from_user.id:
+            await callback.answer("Ошибка", show_alert=True)
+            return
+        
+        # Показываем методы оплаты для продления
+        builder = InlineKeyboardBuilder()
+        
+        if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
+            builder.button(text="💳 Карта/СБП (ЮKassa)", callback_data=f"pay_yookassa_extend_{plan_id}_{key_id}")
+        
+        if CRYPTOBOT_TOKEN:
+            builder.button(text="🤖 CryptoBot (USDT)", callback_data=f"pay_cryptobot_extend_{plan_id}_{key_id}")
+        
+        builder.button(text="⬅️ Назад", callback_data=f"extend_{key_id}")
+        builder.adjust(1)
+        
+        price_int = int(plan['price']) if plan['price'].is_integer() else plan['price']
+        
+        await callback.message.edit_text(
+            f"🔄 <b>Продление ключа #{key_id}</b>\n\n"
+            f"📋 <b>Тариф:</b> {plan['plan_name']}\n"
+            f"💰 <b>Цена:</b> {price_int}₽\n"
+            f"📅 <b>Добавит:</b> {plan['months']} месяцев\n"
+            f"🖥️ <b>Сервер:</b> {plan['host_name']}\n\n"
+            f"Выберите способ оплаты:",
+            reply_markup=builder.as_markup()
+        )
+        
     except Exception as e:
-        logger.error(f"CryptoBot webhook error: {e}", exc_info=True)
-        return web.Response(text='ERROR', status=500)
+        logger.error(f"Error in select plan extend: {e}")
+        await callback.answer("Ошибка", show_alert=True)
 
 # ========== АДМИН ПАНЕЛЬ ==========
 
@@ -2813,7 +2858,6 @@ async def admin_view_host(callback: types.CallbackQuery):
     
     builder = InlineKeyboardBuilder()
     builder.button(text="📦 Добавить тариф", callback_data=f"admin_add_plan_{host_name}")
-    builder.button(text="✏️ Редактировать", callback_data=f"admin_edit_host_{host_name}")
     builder.button(text="🗑️ Удалить", callback_data=f"admin_delete_host_{host_name}")
     builder.button(text="⬅️ Назад", callback_data="admin_hosts")
     builder.adjust(1)
@@ -3160,134 +3204,101 @@ async def admin_reload_settings(callback: types.CallbackQuery):
         logger.error(f"Error reloading settings: {e}")
         await callback.answer(f"❌ Ошибка: {str(e)[:100]}", show_alert=True)
 
-@dp.callback_query(F.data.startswith("extend_"))
-async def extend_key(callback: types.CallbackQuery):
-    """Продление ключа"""
-    try:
-        key_id = int(callback.data.split("_")[1])
-        key_data = db.get_key_by_id(key_id)
-        
-        if not key_data or key_data['user_id'] != callback.from_user.id:
-            await callback.answer("Ключ не найден", show_alert=True)
-            return
-        
-        # Показываем планы для этого хоста
-        host_name = key_data['host_name']
-        plans = db.get_plans_for_host(host_name)
-        
-        if not plans:
-            await callback.answer("Нет доступных тарифов для продления", show_alert=True)
-            return
-        
-        builder = InlineKeyboardBuilder()
-        
-        for plan in plans:
-            price_int = int(plan['price']) if plan['price'].is_integer() else plan['price']
-            builder.button(
-                text=f"{plan['plan_name']} - {price_int}₽",
-                callback_data=f"select_plan_extend_{plan['plan_id']}_{key_id}"
-            )
-        
-        builder.button(text="⬅️ Назад", callback_data=f"view_key_{key_id}")
-        builder.adjust(1)
-        
-        await callback.message.edit_text(
-            f"🔄 <b>Продление ключа #{key_id}</b>\n\n"
-            f"Выберите тариф для продления ключа на сервере {host_name}:",
-            reply_markup=builder.as_markup()
-        )
-        
-    except Exception as e:
-        logger.error(f"Error extending key: {e}")
-        await callback.answer("Ошибка", show_alert=True)
+# ========== ОБРАБОТКА ВЕБХУКОВ ==========
 
-@dp.callback_query(F.data.startswith("select_plan_extend_"))
-async def select_plan_extend(callback: types.CallbackQuery):
-    """Выбор тарифа для продления"""
+async def handle_yookassa_webhook(request: web.Request):
+    """Обработчик вебхуков ЮKassa"""
     try:
-        parts = callback.data.split("_")
-        plan_id = int(parts[3])
-        key_id = int(parts[4])
+        data = await request.json()
+        logger.info(f"YooKassa webhook received: {json.dumps(data, ensure_ascii=False)[:500]}")
         
-        plan = db.get_plan_by_id(plan_id)
-        key_data = db.get_key_by_id(key_id)
+        if data.get('event') == 'payment.succeeded':
+            payment_id = data['object']['id']
+            
+            # Проверяем, не обрабатывали ли мы уже этот платеж
+            webhook_tx = db.get_webhook_transaction(payment_id)
+            if not webhook_tx:
+                logger.warning(f"Unknown payment ID in webhook: {payment_id}")
+                return web.Response(text='Unknown payment', status=400)
+            
+            metadata = data['object']['metadata']
+            
+            # Определяем тип платежа
+            if metadata.get('action') == 'extend':
+                await process_extend_payment(metadata)
+            else:
+                await process_successful_payment(metadata)
+            
+            # Помечаем как обработанное
+            db.mark_webhook_processed(payment_id)
         
-        if not plan or not key_data or key_data['user_id'] != callback.from_user.id:
-            await callback.answer("Ошибка", show_alert=True)
-            return
-        
-        # Показываем методы оплаты для продления
-        builder = InlineKeyboardBuilder()
-        
-        if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
-            builder.button(text="💳 Карта/СБП (ЮKassa)", callback_data=f"pay_yookassa_extend_{plan_id}_{key_id}")
-        
-        if CRYPTOBOT_TOKEN:
-            builder.button(text="🤖 CryptoBot (USDT)", callback_data=f"pay_cryptobot_extend_{plan_id}_{key_id}")
-        
-        builder.button(text="⬅️ Назад", callback_data=f"extend_{key_id}")
-        builder.adjust(1)
-        
-        price_int = int(plan['price']) if plan['price'].is_integer() else plan['price']
-        
-        await callback.message.edit_text(
-            f"🔄 <b>Продление ключа #{key_id}</b>\n\n"
-            f"📋 <b>Тариф:</b> {plan['plan_name']}\n"
-            f"💰 <b>Цена:</b> {price_int}₽\n"
-            f"📅 <b>Добавит:</b> {plan['months']} месяцев\n"
-            f"🖥️ <b>Сервер:</b> {plan['host_name']}\n\n"
-            f"Выберите способ оплаты:",
-            reply_markup=builder.as_markup()
-        )
-        
-    except Exception as e:
-        logger.error(f"Error in select plan extend: {e}")
-        await callback.answer("Ошибка", show_alert=True)
-
-@dp.callback_query(F.data == "withdraw_referral")
-async def withdraw_referral(callback: types.CallbackQuery):
-    """Вывод реферальных средств"""
-    user_id = callback.from_user.id
-    user_data = db.get_user(user_id)
+        return web.Response(text='OK')
     
-    if not user_data:
-        await callback.answer("Ошибка", show_alert=True)
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in YooKassa webhook")
+        return web.Response(text='Invalid JSON', status=400)
+    except Exception as e:
+        logger.error(f"YooKassa webhook error: {e}", exc_info=True)
+        return web.Response(text='ERROR', status=500)
+
+async def handle_cryptobot_webhook(request: web.Request):
+    """Обработчик вебхуков CryptoBot"""
+    try:
+        data = await request.json()
+        logger.info(f"CryptoBot webhook received: {json.dumps(data, ensure_ascii=False)[:500]}")
+        
+        if data.get('update_type') == 'invoice_paid':
+            invoice_id = data['payload']['invoice_id']
+            
+            # Получаем информацию об инвойсе
+            crypto = CryptoPay(CRYPTOBOT_TOKEN)
+            invoices = await crypto.get_invoices(invoice_ids=int(invoice_id))
+            
+            if not invoices:
+                logger.warning(f"Invoice not found: {invoice_id}")
+                return web.Response(text='Invoice not found', status=400)
+            
+            invoice = invoices[0]
+            
+            if invoice.status == "paid":
+                try:
+                    metadata = json.loads(invoice.payload)
+                    
+                    # Определяем тип платежа
+                    if metadata.get('action') == 'extend':
+                        await process_extend_payment(metadata)
+                    else:
+                        await process_successful_payment(metadata)
+                    
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid payload in CryptoBot invoice: {invoice.payload}")
+        
+        return web.Response(text='OK')
+    
+    except json.JSONDecodeError:
+        logger.error("Invalid JSON in CryptoBot webhook")
+        return web.Response(text='Invalid JSON', status=400)
+    except Exception as e:
+        logger.error(f"CryptoBot webhook error: {e}", exc_info=True)
+        return web.Response(text='ERROR', status=500)
+
+# ========== ДОПОЛНИТЕЛЬНЫЕ ОБРАБОТЧИКИ ДЛЯ ВСЕХ КНОПОК ==========
+
+@dp.callback_query(F.data.startswith("admin_edit_host_"))
+async def admin_edit_host(callback: types.CallbackQuery):
+    """Редактирование хоста (заглушка)"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет прав доступа", show_alert=True)
         return
     
-    balance = user_data.get('referral_balance', 0)
-    
-    if balance < MINIMUM_WITHDRAWAL:
-        await callback.answer(
-            f"Минимальная сумма для вывода: {MINIMUM_WITHDRAWAL}₽\n"
-            f"Ваш баланс: {balance:.2f}₽",
-            show_alert=True
-        )
-        return
-    
-    await callback.message.edit_text(
-        f"💰 <b>Вывод реферальных средств</b>\n\n"
-        f"💎 <b>Доступно для вывода:</b> {balance:.2f}₽\n"
-        f"💳 <b>Минимальная сумма:</b> {MINIMUM_WITHDRAWAL}₽\n\n"
-        f"Для вывода средств свяжитесь с поддержкой: {SUPPORT_USER}\n\n"
-        f"В сообщении укажите:\n"
-        f"1. Сумму вывода\n"
-        f"2. Реквизиты для перевода\n"
-        f"3. Ваш ID: {user_id}"
-    )
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USER.replace('@', '')}")
-    builder.button(text="⬅️ Назад", callback_data="show_referrals")
-    builder.adjust(1)
-    
-    await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    host_name = callback.data.split("_")[3]
+    await callback.answer(f"Редактирование хоста {host_name} - функция в разработке", show_alert=True)
 
-# ========== ОБРАТНАЯ НАВИГАЦИЯ ==========
-
-@dp.callback_query(F.data == "back_to_main_menu")
-async def back_to_main_menu(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    await callback.message.edit_text("Главное меню:", reply_markup=create_main_menu(user_id))
+@dp.callback_query(F.data.startswith("pay_heleket_"))
+async def pay_heleket(callback: types.CallbackQuery):
+    """Оплата через Heleket (заглушка)"""
+    plan_id = int(callback.data.split("_")[2])
+    await callback.answer("Оплата через Heleket временно недоступна", show_alert=True)
 
 # ========== ВЕБ-СЕРВЕР ДЛЯ ВЕБХУКОВ ==========
 
@@ -3322,6 +3333,16 @@ async def start_webhook_server():
         logger.error(f"❌ Failed to start webhook server: {e}")
         raise
 
+# ========== ОБРАБОТЧИК ДЛЯ НЕИЗВЕСТНЫХ КОМАНД ==========
+
+@dp.message()
+async def unknown_message(message: types.Message):
+    """Обработчик для неизвестных сообщений"""
+    if message.text and message.text.startswith('/'):
+        await message.answer("Неизвестная команда. Используйте /start или /menu")
+    else:
+        await message.answer("Используйте меню для навигации по боту")
+
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 
 async def main():
@@ -3336,16 +3357,6 @@ async def main():
     if ADMIN_ID == 0 or ADMIN_ID == 123456789:
         print("⚠️  ВНИМАНИЕ: ADMIN_ID не настроен!")
         print("Установите ваш Telegram ID в файле .env")
-    
-    # Проверяем наличие необходимых модулей
-    try:
-        import py3xui
-        import yookassa
-        import aiosend
-    except ImportError as e:
-        print(f"❌ Отсутствует необходимый модуль: {e}")
-        print("Установите зависимости: pip install -r requirements.txt")
-        sys.exit(1)
     
     print("\n" + "="*60)
     print("🚀 Запуск VLESS Telegram Bot...")
