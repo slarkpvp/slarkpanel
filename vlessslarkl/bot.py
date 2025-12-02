@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-VLESS Telegram Bot - ПОЛНАЯ РАБОЧАЯ ВЕРСИЯ
-Версия 3.1 - Добавлены все обработчики callback'ов
+VLESS Telegram Bot - СТАБИЛИЗИРОВАННАЯ ВЕРСИЯ для aiogram 2.25.1
+Версия 4.0 - Полная обработка всех callback'ов и кнопок
 """
 
 import asyncio
@@ -19,7 +19,6 @@ from io import BytesIO
 from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse, quote
 from contextlib import contextmanager
-from hmac import compare_digest
 
 import aiohttp
 from aiogram import Bot, Dispatcher, Router, F, types
@@ -864,7 +863,8 @@ async def cmd_menu(message: types.Message):
 @dp.callback_query(F.data == "back_to_main_menu")
 async def back_to_main_menu(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    await callback.message.edit_text("Главное меню:", reply_markup=create_main_menu(user_id))
+    await callback.message.delete()
+    await callback.message.answer("Главное меню:", reply_markup=create_main_menu(user_id))
 
 # ========== ПРОФИЛЬ И КЛЮЧИ ==========
 
@@ -921,6 +921,7 @@ async def show_profile(callback: types.CallbackQuery):
     builder.adjust(2)
     
     await callback.message.edit_text(profile_text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "manage_keys")
 async def manage_keys(callback: types.CallbackQuery):
@@ -931,7 +932,8 @@ async def manage_keys(callback: types.CallbackQuery):
         text = "🔑 У вас пока нет ключей VPN.\n\nНажмите кнопку ниже, чтобы приобрести ключ:"
         builder = InlineKeyboardBuilder()
         builder.button(text="🛒 Купить VPN", callback_data="buy_new_key")
-        builder.button(text="🎁 Попробовать бесплатно", callback_data="get_trial")
+        if TRIAL_ENABLED and not db.get_user(user_id).get('trial_used'):
+            builder.button(text="🎁 Попробовать бесплатно", callback_data="get_trial")
         builder.button(text="⬅️ Назад", callback_data="back_to_main_menu")
         builder.adjust(1)
     else:
@@ -966,6 +968,7 @@ async def manage_keys(callback: types.CallbackQuery):
         builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("view_key_"))
 async def view_key(callback: types.CallbackQuery):
@@ -1028,6 +1031,7 @@ async def view_key(callback: types.CallbackQuery):
         builder.adjust(2, 1, 1)
         
         await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error viewing key: {e}")
@@ -1072,6 +1076,7 @@ async def show_qr_code(callback: types.CallbackQuery):
             builder.button(text="⬅️ Назад", callback_data=f"view_key_{key_id}")
             
             # Отправляем фото
+            await callback.message.delete()
             await callback.message.answer_photo(
                 photo=BufferedInputFile(qr_image.getvalue(), filename="qrcode.png"),
                 caption=text,
@@ -1108,6 +1113,7 @@ async def delete_key(callback: types.CallbackQuery):
             f"Это действие нельзя отменить.",
             reply_markup=builder.as_markup()
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error in delete_key: {e}")
@@ -1199,6 +1205,7 @@ async def get_trial(callback: types.CallbackQuery):
     builder.adjust(2, 1)
     
     await callback.message.edit_text(success_text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 # ========== ПОКУПКА VPN ==========
 
@@ -1217,6 +1224,7 @@ async def buy_new_key(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text("🛒 <b>Покупка VPN ключа</b>\n\nВыберите сервер:", reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("select_host_"))
 async def select_host(callback: types.CallbackQuery):
@@ -1238,6 +1246,7 @@ async def select_host(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(f"🛒 <b>Тарифы для {host_name}:</b>\n\nВыберите тарифный план:", reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("select_plan_"))
 async def select_plan(callback: types.CallbackQuery):
@@ -1282,6 +1291,7 @@ async def select_plan(callback: types.CallbackQuery):
         "Выберите способ оплаты:",
         reply_markup=builder.as_markup()
     )
+    await callback.answer()
 
 # ========== ПЛАТЕЖИ ЮKASSA ==========
 
@@ -1382,6 +1392,7 @@ async def pay_yookassa(callback: types.CallbackQuery):
         message_text += "Нажмите кнопку для оплаты. После оплаты нажмите 'Проверить оплату'."
         
         await callback.message.edit_text(message_text, reply_markup=builder.as_markup())
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"YooKassa error: {e}")
@@ -1451,7 +1462,7 @@ async def pay_yookassa_extend(callback: types.CallbackQuery):
         
         # Показываем ссылку на оплату
         builder = InlineKeyboardBuilder()
-        builder.button(text="💳 Перейти к оплате", url=payment.confirmation.confirmation_url)
+        builder.button(text="💳 Перейти к оплату", url=payment.confirmation.confirmation_url)
         builder.button(text="🔄 Проверить оплату", callback_data=f"check_payment_{payment.id}")
         builder.button(text="⬅️ Отмена", callback_data=f"select_plan_extend_{plan_id}_{key_id}")
         builder.adjust(1)
@@ -1467,6 +1478,7 @@ async def pay_yookassa_extend(callback: types.CallbackQuery):
             "Нажмите кнопку для оплаты:",
             reply_markup=builder.as_markup()
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"YooKassa extend error: {e}")
@@ -1579,6 +1591,7 @@ async def pay_cryptobot(callback: types.CallbackQuery):
         message_text += "Нажмите кнопку для оплаты. После оплаты нажмите 'Проверить оплату'."
         
         await callback.message.edit_text(message_text, reply_markup=builder.as_markup())
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"CryptoBot error: {e}")
@@ -1656,6 +1669,7 @@ async def pay_cryptobot_extend(callback: types.CallbackQuery):
             "Нажмите кнопку для оплаты:",
             reply_markup=builder.as_markup()
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"CryptoBot extend error: {e}")
@@ -1748,6 +1762,7 @@ async def show_referrals(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "show_referrals_list")
 async def show_referrals_list(callback: types.CallbackQuery):
@@ -1777,6 +1792,7 @@ async def show_referrals_list(callback: types.CallbackQuery):
     builder.button(text="⬅️ Назад", callback_data="show_referrals")
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "referral_help")
 async def referral_help(callback: types.CallbackQuery):
@@ -1800,6 +1816,7 @@ async def referral_help(callback: types.CallbackQuery):
     builder.button(text="⬅️ Назад", callback_data="show_referrals")
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "withdraw_referral")
 async def withdraw_referral(callback: types.CallbackQuery):
@@ -1833,11 +1850,15 @@ async def withdraw_referral(callback: types.CallbackQuery):
     )
     
     builder = InlineKeyboardBuilder()
-    builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USER.replace('@', '')}")
+    if SUPPORT_USER.startswith('@'):
+        builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USER.replace('@', '')}")
+    elif SUPPORT_USER.isdigit():
+        builder.button(text="💬 Написать в поддержку", url=f"tg://user?id={SUPPORT_USER}")
     builder.button(text="⬅️ Назад", callback_data="show_referrals")
     builder.adjust(1)
     
     await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    await callback.answer()
 
 # ========== ПОДДЕРЖКА И О ПРОЕКТЕ ==========
 
@@ -1867,14 +1888,15 @@ async def show_help(callback: types.CallbackQuery):
     )
     
     builder = InlineKeyboardBuilder()
-    if support_user.startswith('@'):
-        builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{support_user.replace('@', '')}")
-    else:
-        builder.button(text="💬 Написать в поддержку", url=f"tg://user?id={support_user}")
+    if SUPPORT_USER.startswith('@'):
+        builder.button(text="💬 Написать в поддержку", url=f"https://t.me/{SUPPORT_USER.replace('@', '')}")
+    elif SUPPORT_USER.isdigit():
+        builder.button(text="💬 Написать в поддержку", url=f"tg://user?id={SUPPORT_USER}")
     builder.button(text="⬅️ Назад", callback_data="back_to_main_menu")
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "show_about")
 async def show_about(callback: types.CallbackQuery):
@@ -1919,6 +1941,7 @@ async def show_about(callback: types.CallbackQuery):
         builder.adjust(2 if len(builder.buttons) > 2 else 1, 1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup(), disable_web_page_preview=True)
+    await callback.answer()
 
 # ========== ОБРАБОТКА УСПЕШНЫХ ПЛАТЕЖЕЙ ==========
 
@@ -2176,6 +2199,7 @@ async def extend_key(callback: types.CallbackQuery):
             f"Выберите тариф для продления ключа на сервере {host_name}:",
             reply_markup=builder.as_markup()
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error extending key: {e}")
@@ -2219,6 +2243,7 @@ async def select_plan_extend(callback: types.CallbackQuery):
             f"Выберите способ оплаты:",
             reply_markup=builder.as_markup()
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error in select plan extend: {e}")
@@ -2262,6 +2287,7 @@ async def admin_panel(callback: types.CallbackQuery):
     builder.adjust(2, 2, 2, 1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
@@ -2324,6 +2350,7 @@ async def admin_stats(callback: types.CallbackQuery):
     builder.adjust(2)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(callback: types.CallbackQuery):
@@ -2367,6 +2394,7 @@ async def admin_users(callback: types.CallbackQuery):
     builder.adjust(3, 3, 3, 3, 2, 1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_search_user")
 async def admin_search_user(callback: types.CallbackQuery, state: FSMContext):
@@ -2389,6 +2417,7 @@ async def admin_search_user(callback: types.CallbackQuery, state: FSMContext):
         "❌ Для отмены введите /cancel",
         parse_mode="HTML"
     )
+    await callback.answer()
 
 @dp.message(Form.waiting_for_user_search)
 async def process_user_search(message: types.Message, state: FSMContext):
@@ -2514,6 +2543,7 @@ async def admin_view_user(callback: types.CallbackQuery):
         builder.adjust(1)
         
         await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error viewing user: {e}")
@@ -2603,6 +2633,7 @@ async def admin_delete_user_keys(callback: types.CallbackQuery):
             f"⚠️ Все VPN подключения пользователя перестанут работать!",
             reply_markup=builder.as_markup()
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error in delete user keys: {e}")
@@ -2676,6 +2707,7 @@ async def admin_message_user(callback: types.CallbackQuery, state: FSMContext):
             f"❌ Для отмены введите /cancel",
             parse_mode="HTML"
         )
+        await callback.answer()
         
     except Exception as e:
         logger.error(f"Error in message user: {e}")
@@ -2748,6 +2780,7 @@ async def admin_hosts(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_add_host")
 async def admin_add_host(callback: types.CallbackQuery, state: FSMContext):
@@ -2766,6 +2799,7 @@ async def admin_add_host(callback: types.CallbackQuery, state: FSMContext):
         "❌ Для отмены введите /cancel",
         parse_mode="HTML"
     )
+    await callback.answer()
 
 @dp.message(Form.waiting_for_host_data)
 async def process_host_data(message: types.Message, state: FSMContext):
@@ -2863,6 +2897,7 @@ async def admin_view_host(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("admin_delete_host_"))
 async def admin_delete_host(callback: types.CallbackQuery):
@@ -2883,6 +2918,7 @@ async def admin_delete_host(callback: types.CallbackQuery):
         f"⚠️ Ключи пользователей перестанут работать!",
         reply_markup=builder.as_markup()
     )
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("admin_confirm_delete_host_"))
 async def admin_confirm_delete_host(callback: types.CallbackQuery):
@@ -2916,6 +2952,7 @@ async def admin_add_plan(callback: types.CallbackQuery, state: FSMContext):
         "❌ Для отмены введите /cancel",
         parse_mode="HTML"
     )
+    await callback.answer()
 
 @dp.message(Form.waiting_for_plan_data)
 async def process_plan_data(message: types.Message, state: FSMContext):
@@ -2996,6 +3033,7 @@ async def admin_plans(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_transactions")
 async def admin_transactions(callback: types.CallbackQuery):
@@ -3036,6 +3074,7 @@ async def admin_transactions(callback: types.CallbackQuery):
     builder.adjust(2)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_settings")
 async def admin_settings(callback: types.CallbackQuery):
@@ -3081,6 +3120,7 @@ async def admin_settings(callback: types.CallbackQuery):
     builder.adjust(1)
     
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
 
 @dp.callback_query(F.data == "admin_edit_settings")
 async def admin_edit_settings(callback: types.CallbackQuery, state: FSMContext):
@@ -3106,6 +3146,7 @@ async def admin_edit_settings(callback: types.CallbackQuery, state: FSMContext):
         "❌ Для отмены введите /cancel",
         parse_mode="HTML"
     )
+    await callback.answer()
 
 @dp.message(Form.waiting_for_settings)
 async def process_settings(message: types.Message, state: FSMContext):
@@ -3284,6 +3325,7 @@ async def handle_cryptobot_webhook(request: web.Request):
 
 # ========== ДОПОЛНИТЕЛЬНЫЕ ОБРАБОТЧИКИ ДЛЯ ВСЕХ КНОПОК ==========
 
+# Обработчики для нереализованных кнопок
 @dp.callback_query(F.data.startswith("admin_edit_host_"))
 async def admin_edit_host(callback: types.CallbackQuery):
     """Редактирование хоста (заглушка)"""
@@ -3299,6 +3341,12 @@ async def pay_heleket(callback: types.CallbackQuery):
     """Оплата через Heleket (заглушка)"""
     plan_id = int(callback.data.split("_")[2])
     await callback.answer("Оплата через Heleket временно недоступна", show_alert=True)
+
+@dp.callback_query(F.data.startswith("pay_ton_"))
+async def pay_ton(callback: types.CallbackQuery):
+    """Оплата через TON (заглушка)"""
+    plan_id = int(callback.data.split("_")[2])
+    await callback.answer("Оплата через TON временно недоступна", show_alert=True)
 
 # ========== ВЕБ-СЕРВЕР ДЛЯ ВЕБХУКОВ ==========
 
@@ -3343,6 +3391,15 @@ async def unknown_message(message: types.Message):
     else:
         await message.answer("Используйте меню для навигации по боту")
 
+# ========== ЗАГЛУШКИ ДЛЯ ОСТАВШИХСЯ CALLBACK ==========
+
+# Обработчики для callback'ов которые могут приходить но не реализованы
+@dp.callback_query()
+async def unknown_callback(callback: types.CallbackQuery):
+    """Обработчик для неизвестных callback'ов"""
+    logger.warning(f"Unknown callback data: {callback.data}")
+    await callback.answer("❌ Эта функция временно недоступна", show_alert=True)
+
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 
 async def main():
@@ -3363,8 +3420,12 @@ async def main():
     print("="*60)
     
     try:
-        # Запускаем веб-сервер для вебхуков
-        webhook_runner = await start_webhook_server()
+        # Запускаем веб-сервер для вебхуков в фоне
+        try:
+            webhook_runner = await start_webhook_server()
+        except Exception as e:
+            logger.warning(f"Failed to start webhook server: {e}")
+            webhook_runner = None
         
         # Получаем информацию о боте
         bot_info = await bot.get_me()
@@ -3401,7 +3462,7 @@ async def main():
         # Очистка ресурсов
         try:
             await bot.session.close()
-            if 'webhook_runner' in locals():
+            if 'webhook_runner' in locals() and webhook_runner:
                 await webhook_runner.cleanup()
         except:
             pass
