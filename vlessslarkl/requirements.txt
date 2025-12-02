@@ -1,0 +1,9 @@
+aiogram==3.21.0
+py3xui==0.4.0
+qrcode[pil]==8.2
+aiohttp==3.9.5
+python-dotenv==1.0.0
+yookassa==3.5.0
+aiosend==2.1.2
+apscheduler==3.10.4
+aiohttp==3.9.5
